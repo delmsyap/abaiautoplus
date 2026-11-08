@@ -393,6 +393,7 @@ class ChatGPTPlatform(BasePlatform):
                   "options": [
                       "",
                       "protocol",
+                      "android_protocol",
                       "camoufox_headed",
                       "camoufox_headless",
                       "bitbrowser_headed",
@@ -404,6 +405,10 @@ class ChatGPTPlatform(BasePlatform):
                  # 留空时回退到 BIT_PROFILE_ID 环境变量。
                  {"key": "bit_profile_id", "label": "BitBrowser Profile ID", "type": "text",
                   "placeholder": "比特浏览器 profile ID（仅 bitbrowser_* 模式下生效）"},
+                 {"key": "android_serial", "label": "Android 设备序列号", "type": "text",
+                  "placeholder": "emulator-5554 (仅 android_protocol 模式生效)"},
+                 {"key": "browser_package", "label": "Android 浏览器包名", "type": "text",
+                  "placeholder": "com.android.chrome (仅 android_protocol 模式生效)"},
                  {"key": "checkout_timeout", "label": "结账超时秒数", "type": "number"},
                  {"key": "checkout_hold_seconds", "label": "前台保留秒数", "type": "number"},
                  # SMS 号码池：批量手机号 + 短信中转 URL，PayPal OTP 用
@@ -837,6 +842,85 @@ class ChatGPTPlatform(BasePlatform):
                         + "），不再回落 camoufox（便于排查）"
                         + (f"；原因: {proto_err}" if proto_err else "")
                     )
+            elif checkout_mode == "android_protocol":
+                # Android 协议模式：Playwright + Android Chrome + CycleTLS
+                log_fn("启动 Android 协议模式 checkout (Playwright + Android Chrome + CycleTLS)...")
+                
+                # Import the Android runtime
+                try:
+                    from platforms.chatgpt.android_runtime import run_android_payment_flow
+                except ImportError as e:
+                    log_fn(f"Android runtime import failed: {e}")
+                    checkout_automation = {"ok": False, "error": f"Android runtime not available: {e}"}
+                else:
+                    # Get credentials from account extra
+                    extra = account.extra or {}
+                    access_token = extra.get("access_token") or account.token
+                    session_token = extra.get("session_token", "")
+                    cookies = extra.get("cookies", "")
+                    
+                    # Manually construct cookie if needed
+                    if not cookies and session_token:
+                        cookies = f"__Secure-next-auth.session-token={session_token}"
+                    
+                    # Card details from params (test mode)
+                    card_number = str(params.get("card_number") or "4242424242424242")
+                    card_exp_month = str(params.get("card_exp_month") or "12")
+                    card_exp_year = str(params.get("card_exp_year") or "2028")
+                    card_cvc = str(params.get("card_cvc") or "123")
+                    
+                    # Billing from params or defaults
+                    billing_name = str(params.get("billing_name") or "John Doe")
+                    billing_email = str(params.get("billing_email") or account.email)
+                    billing_line1 = str(params.get("billing_line1") or "123 Main St")
+                    billing_city = str(params.get("billing_city") or "San Francisco")
+                    billing_state = str(params.get("billing_state") or "CA")
+                    billing_postal = str(params.get("billing_postal") or "94105")
+                    billing_country = str(params.get("billing_country") or params.get("country") or "US").upper()
+                    
+                    plan_name = "chatgptplusplan" if plan == "plus" else "chatgptteamplan"
+                    
+                    # Get proxy
+                    checkout_proxy_local = checkout_proxy or ""
+                    if not checkout_proxy_local:
+                        proxy_region = str(params.get("proxy_region") or params.get("country") or getattr(account, "region", "") or "").strip().upper()
+                        from core.proxy_pool import proxy_pool
+                        checkout_proxy_local = proxy_pool.get_next(region=proxy_region)
+                    
+                    try:
+                        result = asyncio.run(run_android_payment_flow(
+                            access_token=access_token,
+                            card_number=card_number,
+                            card_exp_month=card_exp_month,
+                            card_exp_year=card_exp_year,
+                            card_cvc=card_cvc,
+                            billing_name=billing_name,
+                            billing_email=billing_email,
+                            billing_line1=billing_line1,
+                            billing_city=billing_city,
+                            billing_state=billing_state,
+                            billing_postal=billing_postal,
+                            billing_country=billing_country,
+                            plan_name=plan_name,
+                            checkout_ui_mode="hosted",
+                            proxy=checkout_proxy_local or "",
+                            android_serial=params.get("android_serial", "emulator-5554"),
+                            browser_package=params.get("browser_package", "com.android.chrome"),
+                            log_fn=log_fn,
+                            cancel_check=self.is_cancel_requested,
+                        ))
+                        
+                        if result.get("success"):
+                            log_fn("Android 协议模式 checkout 成功完成")
+                            checkout_automation = {"ok": True, "data": result}
+                        else:
+                            log_fn(f"Android 协议模式 checkout 失败: {result.get('error', 'Unknown error')}")
+                            checkout_automation = {"ok": False, "error": result.get("error", "Unknown error")}
+                            
+                    except Exception as e:
+                        log_fn(f"Android 协议模式异常: {e}")
+                        checkout_automation = {"ok": False, "error": str(e)}
+
             else:
                 try:
                     checkout_automation = _run_camoufox(
@@ -907,3 +991,83 @@ class ChatGPTPlatform(BasePlatform):
         }
 
     
+
+# Android Protocol Integration
+# Added to _handle_generate_link in ChatGPTPlatform class
+
+def _run_android_protocol_checkout(self, account: Account, params: dict, url: str, log_fn: Callable[[str], None]) -> dict:
+    """Run payment using Android Playwright + CycleTLS protocol mode."""
+    proxy = self.config.proxy if self.config else None
+    extra = account.extra or {}
+    
+    # Use proxy from pool if not configured
+    checkout_proxy = proxy
+    if not checkout_proxy:
+        proxy_region = str(params.get("proxy_region") or params.get("country") or getattr(account, "region", "") or "").strip().upper()
+        from core.proxy_pool import proxy_pool
+        checkout_proxy = proxy_pool.get_next(region=proxy_region)
+    
+    # Get credentials from account extra
+    access_token = extra.get("access_token") or account.token
+    session_token = extra.get("session_token", "")
+    cookies = extra.get("cookies", "")
+    
+    # Manually construct cookie if needed
+    if not cookies and session_token:
+        cookies = f"__Secure-next-auth.session-token={session_token}"
+    
+    # Card details from params (test mode)
+    card_number = str(params.get("card_number") or "4242424242424242")
+    card_exp_month = str(params.get("card_exp_month") or "12")
+    card_exp_year = str(params.get("card_exp_year") or "2028")
+    card_cvc = str(params.get("card_cvc") or "123")
+    
+    # Billing from params or defaults
+    billing_name = str(params.get("billing_name") or "John Doe")
+    billing_email = str(params.get("billing_email") or account.email)
+    billing_line1 = str(params.get("billing_line1") or "123 Main St")
+    billing_city = str(params.get("billing_city") or "San Francisco")
+    billing_state = str(params.get("billing_state") or "CA")
+    billing_postal = str(params.get("billing_postal") or "94105")
+    billing_country = str(params.get("billing_country") or params.get("country") or "US").upper()
+    
+    plan = params.get("plan", "plus")
+    plan_name = "chatgptplusplan" if plan == "plus" else "chatgptteamplan"
+    
+    from platforms.chatgpt.android_runtime import run_android_payment_flow
+    
+    log_fn("启动 Android 协议模式 checkout (Playwright + CycleTLS)...")
+    
+    try:
+        result = asyncio.run(run_android_payment_flow(
+            access_token=access_token,
+            card_number=card_number,
+            card_exp_month=card_exp_month,
+            card_exp_year=card_exp_year,
+            card_cvc=card_cvc,
+            billing_name=billing_name,
+            billing_email=billing_email,
+            billing_line1=billing_line1,
+            billing_city=billing_city,
+            billing_state=billing_state,
+            billing_postal=billing_postal,
+            billing_country=billing_country,
+            plan_name=plan_name,
+            checkout_ui_mode="hosted",
+            proxy=checkout_proxy or "",
+            android_serial=params.get("android_serial", "emulator-5554"),
+            browser_package=params.get("browser_package", "com.android.chrome"),
+            log_fn=log_fn,
+            cancel_check=self.is_cancel_requested,
+        ))
+        
+        if result.get("success"):
+            log_fn("Android 协议模式 checkout 成功完成")
+            return {"ok": True, "data": result}
+        else:
+            log_fn(f"Android 协议模式 checkout 失败: {result.get('error', 'Unknown error')}")
+            return {"ok": False, "error": result.get("error", "Unknown error")}
+            
+    except Exception as e:
+        log_fn(f"Android 协议模式异常: {e}")
+        return {"ok": False, "error": str(e)}
